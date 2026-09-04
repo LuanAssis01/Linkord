@@ -5,8 +5,9 @@ import { useRoom } from '../../state/RoomContext';
 import { Avatar } from '../../shared/Avatar';
 import { ChatMessageText } from './ChatMessageText';
 import { ChatAttachment } from './ChatAttachment';
+import { buildMentionLookup, mentionsUser } from '../../shared/lib/mentions';
 import { ALLOWED_REACTIONS } from '../../types/protocol';
-import type { ChatMessage, ReactionEmoji } from '../../types/protocol';
+import type { ChatMessage, PublicUser, ReactionEmoji } from '../../types/protocol';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -55,6 +56,7 @@ interface ChatMessageRowProps {
   showHeader: boolean;
   isMod: boolean;
   isHighlighted: boolean;
+  mentionLookup: Map<string, PublicUser>;
   isEditing: boolean;
   editText: string;
   onEditTextChange: (text: string) => void;
@@ -70,12 +72,11 @@ interface ChatMessageRowProps {
  * author) or stay compact (just the time, on hover, where the avatar
  * would be). */
 function ChatMessageRow({
-  message, showHeader, isMod, isHighlighted, isEditing, editText, onEditTextChange,
+  message, showHeader, isMod, isHighlighted, mentionLookup, isEditing, editText, onEditTextChange,
   onStartEdit, onSaveEdit, onCancelEdit, onReply, onJumpTo,
 }: ChatMessageRowProps) {
   const { state, deleteChatMessage, reactToChatMessage } = useRoom();
   const [reactOpen, setReactOpen] = useState(false);
-  const [moreOpen, setMoreOpen] = useState(false);
   // a CSS-only bar (group-hover) would close as soon as the mouse left the
   // row to reach the popover/dropdown — those portal outside the row's DOM
   // tree, so ":hover" on the row stops applying partway there. Hover
@@ -86,6 +87,12 @@ function ChatMessageRow({
   // against state.me.userId, not state.me.id, or "is this my message?"
   // breaks after reconnecting/reloading (connection id changes, userId doesn't).
   const isMine = message.id === state.me.userId;
+  // author deletes their own message; admin deletes anyone's — same split
+  // the server enforces in handleChatDelete (modules/chat.ts).
+  const canDelete = isMine || isMod;
+  // own messages never "highlight for being mentioned" — mentioning
+  // yourself isn't a notification.
+  const mentionsMe = !isMine && mentionsUser(message.text, mentionLookup, state.me.userId);
 
   function handleEditKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSaveEdit(); }
@@ -96,11 +103,11 @@ function ChatMessageRow({
     <div
       id={`chat-msg-${message.msgId}`}
       onMouseEnter={() => setIsRowActive(true)}
-      onMouseLeave={() => { if (!reactOpen && !moreOpen) setIsRowActive(false); }}
+      onMouseLeave={() => { if (!reactOpen) setIsRowActive(false); }}
       className={cn(
-        'group/msg relative flex gap-3 rounded-md px-3 transition-colors',
+        'group/msg relative flex gap-3 rounded-md border-l-2 border-transparent px-3 transition-colors',
         showHeader ? 'mt-3' : '',
-        isHighlighted ? 'bg-blurple/15' : 'hover:bg-bg-hover'
+        isHighlighted ? 'bg-blurple/15' : mentionsMe ? 'border-l-yellow bg-yellow/10 hover:bg-yellow/15' : 'hover:bg-bg-hover'
       )}
     >
       <div className="w-10 flex-none pt-0.5">
@@ -155,7 +162,7 @@ function ChatMessageRow({
           </div>
         ) : (
           <div className="text-body text-text-primary">
-            <ChatMessageText text={message.text} />
+            <ChatMessageText text={message.text} mentionLookup={mentionLookup} myUserId={state.me.userId} />
             {message.editedAt && <span className="ml-1 select-none text-caption text-text-muted">(editado)</span>}
             {message.attachment && <ChatAttachment attachment={message.attachment} />}
           </div>
@@ -211,6 +218,18 @@ function ChatMessageRow({
             </div>
           </PopoverContent>
         </Popover>
+        {canDelete && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Apagar"
+            className="text-text-muted hover:bg-red/12 hover:text-red"
+            onClick={() => deleteChatMessage(message.msgId)}
+          >
+            <Trash2 size={14} />
+          </Button>
+        )}
         <Button type="button" variant="ghost" size="icon-xs" aria-label="Responder" onClick={onReply}>
           <Reply size={14} />
         </Button>
@@ -218,19 +237,6 @@ function ChatMessageRow({
           <Button type="button" variant="ghost" size="icon-xs" aria-label="Editar" onClick={onStartEdit}>
             <Pencil size={14} />
           </Button>
-        )}
-        {isMod && (
-          <DropdownMenu onOpenChange={(open) => { setMoreOpen(open); if (!open) setIsRowActive(false); }}>
-            <DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-xs" aria-label="Mais opcoes" />}>
-              <MoreHorizontal size={14} />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem variant="destructive" onClick={() => deleteChatMessage(message.msgId)}>
-                <Trash2 size={14} />
-                <span>Apagar</span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
         )}
       </div>
 
@@ -266,7 +272,7 @@ function ChatMessageRow({
                 <span>Editar</span>
               </DropdownMenuItem>
             )}
-            {isMod && (
+            {canDelete && (
               <DropdownMenuItem variant="destructive" onClick={() => deleteChatMessage(message.msgId)}>
                 <Trash2 size={14} />
                 <span>Apagar</span>
@@ -289,7 +295,8 @@ interface ChatMessageListProps {
  * messages grouped by author, date divider, and a per-message action bar
  * on hover (react/reply/edit/delete). */
 export function ChatMessageList({ className, channelId, onReply }: ChatMessageListProps) {
-  const { state, messagesByChannel, editChatMessage } = useRoom();
+  const { state, messagesByChannel, editChatMessage, allUsers } = useRoom();
+  const mentionLookup = useMemo(() => buildMentionLookup(allUsers), [allUsers]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // wraps ONLY the content (not the scrolling viewport) — with
   // overflow-y-auto, the viewport has a fixed size (doesn't grow with
@@ -423,6 +430,7 @@ export function ChatMessageList({ className, channelId, onReply }: ChatMessageLi
               showHeader={showHeader}
               isMod={isMod}
               isHighlighted={highlightedMsgId === message.msgId}
+              mentionLookup={mentionLookup}
               isEditing={editingMsgId === message.msgId}
               editText={editText}
               onEditTextChange={setEditText}
